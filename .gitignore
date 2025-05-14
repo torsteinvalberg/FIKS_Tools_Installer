@@ -1,0 +1,32 @@
+# Bytecode og cache
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build folders
+dist/
+build/
+*.spec
+
+# Inno Setup output
+Output/
+*.iss
+
+# Midlertidige filer
+*.log
+*.tmp
+*.bak
+
+# IDE-spesifikke filer
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS-spesifikke
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Executables
+*.exe
