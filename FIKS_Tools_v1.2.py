@@ -2,12 +2,17 @@
 FIKS Tools v1.2
 
 '''
+print(__file__)
+
 
 import sys
 import os
 import subprocess
 import json
 import re
+from utils.export_thread   import threaded_export
+from utils.export_helpers import generate_gtin_with_progress
+
 import webbrowser
 import tkinter as tk
 import tkinter.ttk as ttk
@@ -23,7 +28,9 @@ import xml.etree.ElementTree as ET
 from lxml import etree
 import random
 import pandas as pd
-from utils.barcode_utils import generate_gtin_barcodes
+from utils.export_thread   import threaded_export
+from utils.export_helpers import generate_gtin_with_progress
+
 import platform
 
 import requests
@@ -31,9 +38,25 @@ import subprocess
 import sys
 import os
 
+
+
 REPO = "torsteinvalberg/FIKS_Tools_Installer"
 CURRENT_VERSION = "1.2"
 
+def center_window(win):
+    # tving fram beregning av alle widgets og størrelser
+    win.update_idletasks()
+    # finn vindu-størrelse
+    w = win.winfo_width()
+    h = win.winfo_height()
+    # finn skjerm-størrelse
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    # regn ut posisjon for midtstilling
+    x = (sw - w) // 2
+    y = (sh - h) // 2
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    
 def check_for_update():
     print("Sjekker etter oppdatering...")
     api_url = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -61,6 +84,52 @@ def check_for_update():
         print(f"Oppdateringssjekk feilet: {e}")
 
 
+def show_loading_popup_with_progress(parent, total, message="Laster og genererer strekkoder..."):
+    popup = tk.Toplevel(parent)
+    popup.title("Vennligst vent")
+    popup.configure(bg='#bfdfff')
+    popup.resizable(False, False)
+    popup.transient(parent)
+    popup.grab_set()
+
+    # --- Bygg innholdet ---
+    tk.Label(popup, text=message, font=("REMA Bold", 12), bg='#bfdfff')\
+      .pack(pady=(15, 5))
+    bar = ttk.Progressbar(popup, mode='determinate', length=250, maximum=total)
+    bar.pack(pady=(0, 5))
+    percent_label = tk.Label(popup, text="0%", font=("REMA Regular", 11), bg='#bfdfff')
+    percent_label.pack()
+
+    # --- La Tk gjøre ferdig layouten ---
+    popup.update_idletasks()
+
+    # --- LES AV størrelsen på popup’en (W x H) ---
+    w = popup.winfo_width()
+    h = popup.winfo_height()
+
+    # --- LES AV skjermstørrelsen (SW x SH) ---
+    sw = popup.winfo_screenwidth()
+    sh = popup.winfo_screenheight()
+
+    # --- BEREGN x,y FOR å midtstille på skjermen ---
+    x = (sw - w) // 2
+    y = (sh - h) // 2
+
+    # --- SETT den endelige geometrien ---
+    popup.geometry(f"{w}x{h}+{x}+{y}")
+
+    # --- Gi popup fokus øverst ---
+    popup.lift()
+    popup.focus_force()
+    popup.attributes('-topmost', True)
+
+    return popup, bar, percent_label
+
+
+
+
+
+
 def format_nok(value):
     try:
         f = float(value)
@@ -73,6 +142,79 @@ def clean_gtin(gtin):
     if len(s) > 13 and s[0] in ("0", "1", "2", "3"):
         s = s[1:]
     return s
+
+def export_to_excel_flexible(file, result, with_barcodes=False, parent_window=None):
+    import os
+    import platform
+    import pandas as pd
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.utils import get_column_letter
+    from openpyxl.drawing.image import Image
+
+    if "Products" not in result:
+        messagebox.showerror("Feil", "Ingen produkter funnet for eksport.")
+        return
+
+    df = pd.DataFrame(result["Products"])
+
+    if with_barcodes:
+        if "GTIN" in df.columns:
+            df["GTIN"] = df["GTIN"].astype(str).str.strip()
+        df = generate_gtin_with_progress(df, parent_window)
+
+
+    df.to_excel(file, index=False, startrow=3)
+
+    wb = load_workbook(file)
+    ws = wb.active
+
+    if "OrderNumber" in result:
+        ws["A1"] = f"OrderNumber: {result['OrderNumber']}"
+        ws["A2"] = f"OrderDate: {result['OrderDate']}"
+    elif "InvoiceNumber" in result:
+        ws["A1"] = f"InvoiceNumber: {result['InvoiceNumber']}"
+        ws["A2"] = f"InvoiceDate: {result['InvoiceDate']}"
+        ws["A3"] = f"Total: {result['Summary']['TotalAmount']}  |  MVA: {result['Summary']['VatAmount']} {result['Summary']['Currency']}"
+
+    # Legg til strekkodebilder hvis aktuelt
+    if with_barcodes:
+        header_row = ws[4]
+        col_map = {cell.value: cell.column for cell in header_row if cell.value}
+        barcode_col = col_map.get("StrekkodeFil")
+
+        if barcode_col:
+            for idx, row in df.iterrows():
+                img_path = row.get("StrekkodeFil")
+                if img_path and os.path.exists(img_path):
+                    try:
+                        img = Image(img_path)
+                        img.height = 100
+                        img.width = 300
+                        cell = ws.cell(row=5 + idx, column=barcode_col)
+                        ws.add_image(img, cell.coordinate)
+                        ws.row_dimensions[5 + idx].height = 110
+                    except Exception as e:
+                        print(f"[FEIL] Kunne ikke legge inn strekkode: {e}")
+
+    # Juster kolonnebredde
+    for col in range(1, ws.max_column + 1):
+        max_length = 0
+        col_letter = get_column_letter(col)
+        for row in range(1, ws.max_row + 1):
+            val = ws.cell(row=row, column=col).value
+            if val:
+                max_length = max(max_length, len(str(val)))
+        ws.column_dimensions[col_letter].width = max_length + 2
+
+    wb.save(file)
+
+    if platform.system() == "Windows":
+        os.startfile(file)
+    elif platform.system() == "Darwin":
+        os.system(f"open \"{file}\"")
+    else:
+        os.system(f"xdg-open \"{file}\"")
+
 
 # Paths
 BASE_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
@@ -192,9 +334,14 @@ def extract_clean_xml_block(raw_text: str) -> str:
 
 def detect_extractor(xml_text: str):
     for name, entry in EXTRACTOR_REGISTRY.items():
-        if entry['match'](xml_text):
-            return entry['class']()
+        try:
+            if entry['match'](xml_text):
+                print(f"[INFO] Matcher extractor: {name}")
+                return entry['class']()
+        except Exception as e:
+            print(f"[ERROR] Feil ved matching av extractor {name}: {e}")
     raise ValueError("Ukjent XML-type. Kan ikke velge riktig extractor.")
+
 def register_extractor(name, match_fn, extractor_class):
     print(f"[REGISTER] Extractor: {name}")
     EXTRACTOR_REGISTRY[name] = {
@@ -657,6 +804,22 @@ Smart Extractor
 
     def perform_extraction(self):
         try:
+            raw_input = self.xml_text.get('1.0', tk.END)
+            print("[DEBUG] Rå-innlimt XML:", raw_input[:300], flush=True)
+
+            raw = extract_clean_xml_block(raw_input)
+            print("[DEBUG] Etter extract_clean_xml_block:", raw[:300], flush=True)
+
+            self.extractor_instance = detect_extractor(raw)
+            print(f"[DEBUG] Valgt extractor: {type(self.extractor_instance).__name__}", flush=True)
+
+            result = self.extractor_instance.extract(raw)
+            print(f"[DEBUG] Antall produkter funnet: {len(result.get('Products', []))}", flush=True)
+        except Exception as e:
+            messagebox.showerror("Feil", str(e))
+            return
+
+        try:
             raw = extract_clean_xml_block(self.xml_text.get('1.0', tk.END))
             self.extractor_instance = detect_extractor(raw)
             result = self.extractor_instance.extract(raw)
@@ -708,59 +871,38 @@ Smart Extractor
 
             tree.pack(fill='both', expand=True)
 
-            def export_to_excel_asn():
-                from openpyxl import Workbook
-                from openpyxl.styles import Font
-                from openpyxl.utils import get_column_letter
+            btn_row = tk.Frame(preview, bg=BACKGROUND_COLOR)
+            btn_row.pack(pady=10)
 
-                file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
-                if not file:
-                    return
+            from utils.export_thread import threaded_export
 
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "ASN-Export"
-                row_idx = 1
-                bold_font = Font(bold=True)
+            btn_row = tk.Frame(preview, bg=BACKGROUND_COLOR)
+            btn_row.pack(pady=10)
 
-                for sscc, items in result["Packages"].items():
-                    if not items:
-                        continue
+            from utils.export_thread import threaded_export  # Pass på at dette ligger øverst i filen
 
-                    ordernum = items[0].get("BuyersOrderNumber", "")
-                    ws.cell(row=row_idx, column=1, value=f"SSCC: {sscc}").font = bold_font
-                    ws.cell(row=row_idx, column=2, value=f"Ordernummer: {ordernum}").font = bold_font
-                    row_idx += 1
+            def trigger_excel_export_asn(barcodes=False):
+                file = filedialog.asksaveasfilename(
+                    defaultextension=".xlsx",
+                    filetypes=[("Excel Files", "*.xlsx")],
+                    title="Lagre som"
+                )
+                if file:
+                    threaded_export(
+                        file=file,
+                        result={
+                            "Products": [item for group in result["Packages"].values() for item in group],
+                            "OrderNumber": next((item.get("BuyersOrderNumber") for group in result["Packages"].values() for item in group if item.get("BuyersOrderNumber")), ""),
+                            "OrderDate": "",  # Kan legges til senere om ønskelig
+                        },
+                        with_barcodes=barcodes,
+                        parent_window=self.root,
+                        export_func=export_to_excel_flexible
+                    )
 
-                    ws.cell(row=row_idx, column=1, value="Varenavn").font = bold_font
-                    ws.cell(row=row_idx, column=2, value="GTIN").font = bold_font
-                    ws.cell(row=row_idx, column=3, value="EPD").font = bold_font
-                    ws.cell(row=row_idx, column=4, value="Quantity").font = bold_font
-                    row_idx += 1
 
-                    for item in items:
-                        qty = item.get("Quantity", "").replace(" PCE", "").strip()
-                        ws.cell(row=row_idx, column=1, value=item.get("Varenavn", ""))
-                        ws.cell(row=row_idx, column=2, value=item.get("GTIN", ""))
-                        ws.cell(row=row_idx, column=3, value=item.get("EPD", ""))
-                        ws.cell(row=row_idx, column=4, value=qty)
-                        row_idx += 1
-
-                    row_idx += 1  # Ekstra luft mellom genererte GTINs
-
-                for col in range(1, ws.max_column + 1):
-                    max_length = 0
-                    col_letter = get_column_letter(col)
-                    for row in range(1, ws.max_row + 1):
-                        val = ws.cell(row=row, column=col).value
-                        if val:
-                            max_length = max(max_length, len(str(val)))
-                    ws.column_dimensions[col_letter].width = max_length + 2
-
-                wb.save(file)
-                os.startfile(file)
-
-            self.create_styled_button(preview, text="Eksporter til Excel", command=export_to_excel_asn).pack(pady=10)
+            self.create_styled_button(btn_row, text="Eksporter til Excel", command=lambda: trigger_excel_export_asn(False)).pack(side='left', padx=5)
+            self.create_styled_button(btn_row, text="Eksporter til Excel med strekkoder", command=lambda: trigger_excel_export_asn(True)).pack(side='left', padx=5)
 
             return
 
@@ -808,135 +950,87 @@ Smart Extractor
 
             tree.pack(fill='both', expand=True)
 
-            def export_to_excel_invoice(file, result):
-                if "Products" not in result:
-                    messagebox.showerror("Feil", "Ingen produkter funnet for eksport.")
-                    return
+            btn_row = tk.Frame(preview, bg=BACKGROUND_COLOR)
+            btn_row.pack(pady=10)
 
-                df = pd.DataFrame(result["Products"])
-
-                # Rename Description → Varenavn hvis det finnes
-                if "Description" in df.columns:
-                    df.rename(columns={"Description": "Varenavn"}, inplace=True)
-
-                # Rekkefølge for kolonner
-                preferred_order = ["Varenavn", "GTIN", "EPD", "UnitPrice", "LineItemAmount", "VatAmount", "QuantityInvoiced"]
-                df = df[[col for col in preferred_order if col in df.columns]]
-
-                # Strekkodegenerator (bruker utils-funksjon)
-                from utils.barcode_utils import generate_gtin_barcodes
-                df = generate_gtin_barcodes(df)
-
-                # Eksporter til Excel
-                df.to_excel(file, index=False, startrow=3)
-
-                # Legg til strekkodebilder med openpyxl
-                from openpyxl import load_workbook
-                from openpyxl.drawing.image import Image
-
-                wb = load_workbook(file)
-                ws = wb.active
-
-                header_row = ws[4]
-                col_map = {cell.value: cell.column for cell in header_row if cell.value}
-                barcode_col = col_map.get("StrekkodeFil")
-
-                if barcode_col:
-                    for idx, row in df.iterrows():
-                        img_path = row["StrekkodeFil"]
-                        if img_path and os.path.exists(img_path):
-                            try:
-                                img = Image(img_path)
-                                img.height = 100
-                                img.width = 300
-                                cell = ws.cell(row=5 + idx, column=barcode_col)
-                                ws.add_image(img, cell.coordinate)
-                                ws.row_dimensions[5 + idx].height = 110
-                            except Exception as e:
-                                print(f"Kunne ikke legge inn strekkode: {e}")
-
-                wb.save(file)
-
-
-                if platform.system() == "Windows":
-                    os.startfile(file)
-                elif platform.system() == "Darwin":
-                    os.system(f"open \"{file}\"")
-                else:
-                    os.system(f"xdg-open \"{file}\"")
-
-            def trigger_excel_export():
-                file = filedialog.asksaveasfilename(
-                    defaultextension=".xlsx",
-                    filetypes=[("Excel Files", "*.xlsx")],
-                    title="Lagre som"
-                )
-                if not file:
-                    return
-                export_to_excel_invoice(file, result)
-                
-            def trigger_excel_export_with_barcodes():
-                file = filedialog.asksaveasfilename(
-                    defaultextension=".xlsx",
-                    filetypes=[("Excel Files", "*.xlsx")],
-                    title="Lagre som"
-                )
-                if not file:
-                    return
-                export_to_excel_invoice(file, result)
+            from utils.export_thread import threaded_export
 
             btn_row = tk.Frame(preview, bg=BACKGROUND_COLOR)
             btn_row.pack(pady=10)
 
-            ttk.Button(btn_row, text="Eksporter til Excel", command=trigger_excel_export).pack(side='left', padx=5)
-            ttk.Button(btn_row, text="Eksporter til Excel med strekkoder", command=trigger_excel_export_with_barcodes).pack(side='left', padx=5)
+            def trigger_invoice_export(barcodes=False):
+                file = filedialog.asksaveasfilename(
+                    defaultextension=".xlsx",
+                    filetypes=[("Excel Files", "*.xlsx")],
+                    title="Lagre som"
+                )
+                if file:
+                    threaded_export(
+                        file=file,
+                        result=result,
+                        with_barcodes=barcodes,
+                        parent_window=self.root,
+                        export_func=export_to_excel_flexible
+                    )
+
+
+            self.create_styled_button(btn_row, text="Eksporter til Excel", command=lambda: trigger_invoice_export(False)).pack(side='left', padx=5)
+            self.create_styled_button(btn_row, text="Eksporter til Excel med strekkoder", command=lambda: trigger_invoice_export(True)).pack(side='left', padx=5)
+
+
 
             return
 
 
-        # Visning for OpenPurchaseOrderToAzure
-        if not result["Products"]:
-            messagebox.showinfo("Ingen data", "Ingen produkter ble funnet.")
-            return
-
-        preview = tk.Toplevel(self.extractor)
-        preview.title("Forhåndsvisning – Bestilling")
-        preview.configure(bg=BACKGROUND_COLOR)
-
-        if "OrderNumber" in result:
-            tk.Label(preview, text=f"OrderNumber: {result['OrderNumber']}", font=self.custom_font_bold, bg=BACKGROUND_COLOR).pack()
-            tk.Label(preview, text=f"OrderDate: {result['OrderDate']}", font=self.custom_font_regular, bg=BACKGROUND_COLOR).pack()
-        elif "InvoiceNumber" in result:
-            tk.Label(preview, text=f"InvoiceNumber: {result['InvoiceNumber']}", font=self.custom_font_bold, bg=BACKGROUND_COLOR).pack()
-            tk.Label(preview, text=f"InvoiceDate: {result['InvoiceDate']}", font=self.custom_font_regular, bg=BACKGROUND_COLOR).pack()
-
-
-        all_keys = {k for row in result["Products"] for k in row}
-        desired_order = ["Varenavn", "REMAid", "EPD", "GTIN", "GTIN-FPAK", "LV", "Quantity"]
-        cols = [col for col in desired_order if col in all_keys] + sorted(all_keys - set(desired_order))
-
-        tree = ttk.Treeview(preview, columns=cols, show='headings')
-        font_obj = tkfont.Font(font=self.custom_font_regular)
-
-        for col in cols:
-            tree.heading(col, text=col)
-            if col == "Varenavn":
-                max_width = max([font_obj.measure(str(row.get(col, ""))) for row in result["Products"]] + [font_obj.measure(col)])
-                width_px = min(max_width + 20, 800)
-                tree.column(col, width=width_px, anchor="w")
-            else:
-                tree.column(col, width=120, anchor="center")
-
-        for row in result["Products"]:
-            values = [row.get(col, "") for col in cols]
-            tree.insert('', 'end', values=values)
+     # … din eksisterende preview-kode …
 
         tree.pack(fill='both', expand=True)
 
+        # ── Legg til eksport-knapper ════════════════════════════════════════
+        from utils.export_thread import threaded_export
+        from utils.export_helpers import export_to_excel_flexible  # eller hva helper-funksjonen din heter
+
+        btn_frame = tk.Frame(preview, bg=BACKGROUND_COLOR)
+        btn_frame.pack(pady=10)
+
+        # Funksjon som spør om filnavn og starter eksport i bakgrunn
+        def _trigger_po_export(with_barcodes=False):
+            file = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel-filer", "*.xlsx")],
+                title="Lagre bestilling som…"
+            )
+            if not file:
+                return
+
+            # starter popup + tråd som kjører export_to_excel_flexible
+            threaded_export(
+                file=file,
+                result=result,
+                with_barcodes=with_barcodes,
+                parent_window=self.root,
+                export_func=export_to_excel_flexible
+            )
+
+        # Knapp for vanlig eksport
+        self.create_styled_button(
+            btn_frame,
+            text="Eksporter til Excel",
+            command=lambda: _trigger_po_export(False)
+        ).pack(side='left', padx=5)
+
+        # Knapp for eksport med strekkoder
+        self.create_styled_button(
+            btn_frame,
+            text="Eksporter til Excel med strekkoder",
+            command=lambda: _trigger_po_export(True)
+        ).pack(side='left', padx=5)
+
+
         def export_to_excel():
-            
             import platform
             from openpyxl import load_workbook
+            from openpyxl.utils import get_column_letter
 
             file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
             if file:
@@ -944,9 +1038,12 @@ Smart Extractor
                 if "Quantity" in df.columns:
                     cols = [col for col in df.columns if col != "Quantity"] + ["Quantity"]
                     df = df[cols]
+                    
                 df.to_excel(file, index=False, startrow=3)
+
                 wb = load_workbook(file)
                 ws = wb.active
+
                 if "OrderNumber" in result:
                     ws["A1"] = f"OrderNumber: {result['OrderNumber']}"
                     ws["A2"] = f"OrderDate: {result['OrderDate']}"
@@ -955,10 +1052,6 @@ Smart Extractor
                     ws["A2"] = f"InvoiceDate: {result['InvoiceDate']}"
                     ws["A3"] = f"Total: {result['Summary']['TotalAmount']}  |  MVA: {result['Summary']['VatAmount']} {result['Summary']['Currency']}"
 
-
-                from openpyxl.utils import get_column_letter
-
-                # Auto-adjust column widths
                 for col in range(1, ws.max_column + 1):
                     max_length = 0
                     col_letter = get_column_letter(col)
@@ -966,8 +1059,7 @@ Smart Extractor
                         val = ws.cell(row=row, column=col).value
                         if val:
                             max_length = max(max_length, len(str(val)))
-                    adjusted_width = max_length + 2
-                    ws.column_dimensions[col_letter].width = adjusted_width
+                    ws.column_dimensions[col_letter].width = max_length + 2
 
                 wb.save(file)
 
@@ -978,12 +1070,86 @@ Smart Extractor
                 else:
                     os.system(f"xdg-open \"{file}\"")
 
-        self.create_styled_button(preview, text="Eksporter til Excel", command=export_to_excel).pack(pady=10)
+        def export_to_excel_with_barcodes():
+            import platform
+            from openpyxl import load_workbook
+            from openpyxl.utils import get_column_letter
+            from openpyxl.drawing.image import Image
+            from utils.barcode_utils import generate_gtin_barcodes
+
+            file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
+            if not file:
+                return
+
+            df = pd.DataFrame(result["Products"])
+
+            if "Quantity" in df.columns:
+                cols = [col for col in df.columns if col != "Quantity"] + ["Quantity"]
+                df = df[cols]
+
+            df["GTIN"] = df["GTIN"].astype(str).str.strip()
+
+            df = generate_gtin_barcodes(df)
+            df.to_excel(file, index=False, startrow=3)
+
+            wb = load_workbook(file)
+            ws = wb.active
+
+            if "OrderNumber" in result:
+                ws["A1"] = f"OrderNumber: {result['OrderNumber']}"
+                ws["A2"] = f"OrderDate: {result['OrderDate']}"
+            elif "InvoiceNumber" in result:
+                ws["A1"] = f"InvoiceNumber: {result['InvoiceNumber']}"
+                ws["A2"] = f"InvoiceDate: {result['InvoiceDate']}"
+                ws["A3"] = f"Total: {result['Summary']['TotalAmount']}  |  MVA: {result['Summary']['VatAmount']} {result['Summary']['Currency']}"
+
+            header_row = ws[4]
+            col_map = {cell.value: cell.column for cell in header_row if cell.value}
+            barcode_col = col_map.get("StrekkodeFil")
+
+            if barcode_col:
+                for idx, row in df.iterrows():
+                    img_path = row.get("StrekkodeFil")
+                    if img_path and os.path.exists(img_path):
+                        try:
+                            img = Image(img_path)
+                            img.height = 100
+                            img.width = 300
+                            cell = ws.cell(row=5 + idx, column=barcode_col)
+                            ws.add_image(img, cell.coordinate)
+                            ws.row_dimensions[5 + idx].height = 110
+                        except Exception as e:
+                            print(f"Feil ved bildeinnsetting: {e}")
+
+            for col in range(1, ws.max_column + 1):
+                max_length = 0
+                col_letter = get_column_letter(col)
+                for row in range(1, ws.max_row + 1):
+                    val = ws.cell(row=row, column=col).value
+                    if val:
+                        max_length = max(max_length, len(str(val)))
+                ws.column_dimensions[col_letter].width = max_length + 2
+
+            wb.save(file)
+
+            if platform.system() == "Windows":
+                os.startfile(file)
+            elif platform.system() == "Darwin":
+                os.system(f"open \"{file}\"")
+            else:
+                os.system(f"xdg-open \"{file}\"")
+
+        btn_row = tk.Frame(preview, bg=BACKGROUND_COLOR)
+        btn_row.pack(pady=10)
+
+        self.create_styled_button(btn_row, text="Eksporter til Excel", command=export_to_excel).pack(side='left', padx=5)
+        self.create_styled_button(btn_row, text="Eksporter til Excel med strekkoder", command=export_to_excel_with_barcodes).pack(side='left', padx=5)
+
+    from utils.gui_utils import center_window
 
     def smart_extractor_window(self):
         self.extractor = tk.Toplevel(self.root)
         self.extractor.title("Smart Extractor")
-        self.extractor.geometry("800x700")
         self.extractor.configure(bg=BACKGROUND_COLOR)
         self.extractor.iconphoto(False, tk.PhotoImage(file=LOGO_PATH))
 
@@ -1158,47 +1324,57 @@ class InvoiceToGoldExtractor(SmartXMLExtractor):
         )
 
     def extract(self, xml_text):
+        print("[INFO] Starter InvoiceToGoldExtractor.extract()")
+
         parser = etree.XMLParser(recover=True)
-        root = etree.fromstring(xml_text.encode(), parser=parser)
+        try:
+            root = etree.fromstring(xml_text.encode(), parser=parser)
+        except Exception as e:
+            print(f"[ERROR] Kunne ikke parse XML: {e}")
+            return {
+                "InvoiceNumber": "",
+                "InvoiceDate": "",
+                "Products": [],
+                "Summary": {}
+            }
 
         items = root.xpath(".//*[local-name()='BaseItemDetails']")
+        print(f"[INFO] Antall <BaseItemDetails>-elementer funnet: {len(items)}")
+
         products = []
 
-        for item in items:
-            def _find(path):
-                res = item.xpath(path)
+        def safe_find(context, path):
+            try:
+                res = context.xpath(path)
                 return res[0].text.strip() if res and res[0].text else ""
+            except Exception as e:
+                print(f"[WARN] XPath-feil på path '{path}': {e}")
+                return ""
 
-            products.append({
-                "Varenavn": _find(".//*[local-name()='Description']"),
-                "GTIN": clean_gtin(_find(".//*[local-name()='AdditionalProductId'][*[local-name()='Code']='GTIN']/*[local-name()='Text']")),
-                "EPD": _find(".//*[local-name()='AdditionalProductId'][*[local-name()='Code']='EPD']/*[local-name()='Text']"),
-                "UnitPrice": _find(".//*[local-name()='UnitPrice']"),
-                "LineItemAmount": _find(".//*[local-name()='LineItemAmount']"),
-                "VatAmount": _find(".//*[local-name()='VatAmount']"),
-                "QuantityInvoiced": _find(".//*[local-name()='QuantityInvoiced']")
-            })
+        for idx, item in enumerate(items):
+            try:
+                product = {
+                    "Varenavn": safe_find(item, ".//*[local-name()='Description']"),
+                    "GTIN": clean_gtin(safe_find(item, ".//*[local-name()='AdditionalProductId'][*[local-name()='Code']='GTIN']/*[local-name()='Text']")),
+                    "EPD": safe_find(item, ".//*[local-name()='AdditionalProductId'][*[local-name()='Code']='EPD']/*[local-name()='Text']"),
+                    "UnitPrice": safe_find(item, ".//*[local-name()='UnitPrice']"),
+                    "LineItemAmount": safe_find(item, ".//*[local-name()='LineItemAmount']"),
+                    "VatAmount": safe_find(item, ".//*[local-name()='VatAmount']"),
+                    "QuantityInvoiced": safe_find(item, ".//*[local-name()='QuantityInvoiced']")
+                }
+                products.append(product)
+                print(f"[DEBUG] Produkt {idx+1}: {product}")
+            except Exception as e:
+                print(f"[ERROR] Feil ved produkt {idx+1}: {e}")
 
+        # Metadata
+        invoice_number = safe_find(root, ".//*[local-name()='InvoiceNumber']")
+        invoice_date = safe_find(root, ".//*[local-name()='InvoiceDate']")
+        total_amount = safe_find(root, ".//*[local-name()='LineItemTotalsAmount']")
+        vat_amount = safe_find(root, ".//*[local-name()='VatAmount']")
+        currency = safe_find(root, ".//*[local-name()='Currency']")
 
-        # Apply GTIN cleanup
-        for p in products:
-            if "GTIN" in p:
-                p["GTIN"] = clean_gtin(p["GTIN"])
-
-
-        # Simple XPath-based helpers
-        def _find(root, path):
-            res = root.xpath(path)
-            return res[0].text.strip() if res and res[0].text else ""
-
-        parser = etree.XMLParser(recover=True)
-        root = etree.fromstring(xml_text.encode(), parser=parser)
-
-        invoice_number = _find(root, ".//*[local-name()='InvoiceNumber']")
-        invoice_date = _find(root, ".//*[local-name()='InvoiceDate']")
-        total_amount = _find(root, ".//*[local-name()='LineItemTotalsAmount']")
-        vat_amount = _find(root, ".//*[local-name()='VatAmount']")
-        currency = _find(root, ".//*[local-name()='Currency']")
+        print(f"[INFO] Hentet {len(products)} produkter. Fakturanr: {invoice_number}, Dato: {invoice_date}")
 
         return {
             "InvoiceNumber": invoice_number,
@@ -1212,37 +1388,41 @@ class InvoiceToGoldExtractor(SmartXMLExtractor):
         }
 
 
-import xml.etree.ElementTree as ET
-
 # EXTRACTOR REGISTRERING
 register_extractor(
     "ASN",
-    lambda xml: "<deliverynote" in xml.lower(),
+    lambda xml: "<deliverynotedetails" in xml.lower() or "<deliverynote>" in xml.lower(),
     AdvancedShippingNoteExtractor
 )
 
+print("[DEBUG] Ferdig med registrering av extractors", flush=True)
+
 
 def is_invoice_to_gold(xml: str) -> bool:
-    """
-    Returnerer True så snart vi finner både <InvoiceNumber> og <InvoiceDate>
-    (case-insensitivt), uansett hvor i dokumentet de står.
-    """
-    has_num  = re.search(r'<\s*InvoiceNumber\s*>', xml, re.IGNORECASE) is not None
-    has_date = re.search(r'<\s*InvoiceDate\s*>',  xml, re.IGNORECASE) is not None
-
-    return has_num and has_date
-
+    try:
+        parser = etree.XMLParser(recover=True)
+        root = etree.fromstring(xml.encode("utf-8"), parser=parser)
+        has_number = root.xpath(".//*[local-name()='InvoiceNumber']")
+        has_date = root.xpath(".//*[local-name()='InvoiceDate']")
+        return bool(has_number and has_date)
+    except Exception as e:
+        print(f"[DEBUG] is_invoice_to_gold() feilet: {e}", flush=True)
+        return False
 
 register_extractor(
     "InvoiceToGold",
     is_invoice_to_gold,
     InvoiceToGoldExtractor
 )
+print("[DEBUG] Ferdig med registrering av extractors", flush=True)
+
 register_extractor(
     "POtoAzure",
-    lambda xml: 'messagetype="orders"' in xml.lower(),
+    lambda xml: 'messagetype="orders"' in xml.lower() or "open purchase order to azure" in xml.lower(),
     OpenPurchaseOrderToAzureExtractor
 )
+
+print("[DEBUG] Ferdig med registrering av extractors", flush=True)
 
 
 # 🔜 Placeholder: Register new extractors as needed
@@ -1251,5 +1431,10 @@ register_extractor(
 
 
 if __name__ == "__main__":
+    print("[MAIN] Starter FIKS Tools", flush=True)
     check_for_update()
-    root=tk.Tk();app=FIKSToolsApp(root);root.mainloop()
+    root = tk.Tk()
+    app = FIKSToolsApp(root)
+    center_window(root)
+
+    root.mainloop()
